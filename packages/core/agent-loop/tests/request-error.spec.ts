@@ -146,4 +146,35 @@ describe('agent/request-error', () => {
       data: { reason: { kind: 'error' } },
     })
   })
+
+  it('uses the new model on the next request when the model is switched during a retry', async () => {
+    const adapter = new MockAdapter([
+      fail('busy', 'RATE_LIMIT'),
+      textResponse('ok'),
+    ])
+    const ctx = await harness(adapter)
+    const agent = await ctx.agentLoop.create(brandString<SessionId>('request-error-model-switch'), {
+      provider: 'mock',
+      model: 'old',
+    })
+    let switched = false
+    ctx.on('agent/request-error', () => {
+      // Simulate the user switching models while the retry is being decided.
+      if (!switched) {
+        switched = true
+        agent.model.select({ provider: 'mock', model: 'new' })
+      }
+      return { kind: 'retry' }
+    })
+
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
+
+    // The abandoned route is not retried: the next request uses the new model.
+    expect(adapter.requests).toHaveLength(2)
+    expect(adapter.requests.map(request => request.model)).toEqual(['old', 'new'])
+    expect(agent.session.snapshotEvents().flatMap(event =>
+      event.type === 'request/header' ? [event.data.header.config.model] : [])).toEqual(['old', 'new'])
+  })
+
 })
