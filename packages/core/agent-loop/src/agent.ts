@@ -124,6 +124,8 @@ export class ReactLoopAgent implements Agent {
 
   /** Whether this loop instance has appended its initial/resume request anchor. */
   private requestHeaderLogged = false
+  /** Set by step() when a retry is abandoned because the model was switched. */
+  private modelSwitchPending = false
   /** Surface generation at attachment or the preceding built request. */
   private requestSurfaceGeneration: number
   private readonly runtimeContext: RuntimeContextProjection
@@ -374,6 +376,14 @@ export class ReactLoopAgent implements Agent {
             // max-tokens is sticky: once any step hits the ceiling, later steps
             // that complete normally must not downgrade the turn outcome.
             const stepEnd = await this.step(decision)
+            // A mid-retry model switch ended step() early; re-enter preStep so
+            // the new route is assembled with a fresh retry budget.
+            if (this.modelSwitchPending) {
+              this.modelSwitchPending = false
+              turnEnds = null
+              target = 'next-step'
+              continue
+            }
             // max-tokens stays sticky: a later completed step must not
             // downgrade the turn outcome.
             if (turnEnds === null || turnEnds.kind !== 'max-tokens') turnEnds = stepEnd
@@ -565,6 +575,18 @@ export class ReactLoopAgent implements Agent {
           signal.throwIfAborted()
           if (action?.kind !== 'retry') {
             throw LlmError.fromFailure(finish.failure)
+          }
+          // Do not keep retrying a route the user has already switched away
+          // from. The live selection changed while this step is pinned to
+          // the one frozen at preStep. End the step here (before the next
+          // request is prepared, whose assertion forbids a mid-step swap);
+          // turn() then re-enters preStep and re-resolves tools/prompt/header.
+          const liveSelection = this.model.current()
+          if (liveSelection !== undefined && (liveSelection.provider !== decision.selection.provider
+            || liveSelection.model !== decision.selection.model
+            || liveSelection.reasoningEffort !== decision.selection.reasoningEffort)) {
+            this.modelSwitchPending = true
+            return null
           }
           continue
         }
